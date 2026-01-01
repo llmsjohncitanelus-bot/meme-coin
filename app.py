@@ -498,7 +498,7 @@ async def helius_webhook(request: Request):
             tx_type = (tx.get("type") or "").upper()
 
             # IMPORTANT: keep SWAP allowed or you'll rarely see anything
-            if tx_type and tx_type not in ALLOWED_TYPES:
+            if ALLOWED_TYPES and tx_type and tx_type not in ALLOWED_TYPES:
                 reasons["ignored"] += 1
                 reasons["bad_type"] += 1
                 continue
