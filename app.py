@@ -7,6 +7,7 @@ import threading
 from queue import SimpleQueue
 from collections import deque
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -29,14 +30,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 HELIUS_AUTH_HEADER = os.getenv("HELIUS_AUTH_HEADER", "").strip()
 
-# If empty -> accept ALL tx types (recommended). You still only ALERT on BUY/SELL.
+# If empty -> accept ALL tx types. You still only ALERT on BUY/SELL.
 ALLOWED_TYPES = set(
     t for t in os.getenv("ALLOWED_TYPES", "").replace(" ", "").split(",") if t
 )
 
 TG_MSG_INTERVAL = float(os.getenv("TG_MSG_INTERVAL", "0.75"))
 
-# ---- Your requested snippet ----
+# ---- Track wallets (your snippet) ----
 WATCH_WALLETS = set(
     w for w in os.getenv("WATCH_WALLETS", "").replace(" ", "").split(",") if w
 )
@@ -52,7 +53,36 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-QUOTE_MINTS = {WSOL_MINT, USDC_MINT}
+
+EXTRA_QUOTES = set(
+    m for m in os.getenv("QUOTE_MINTS_EXTRA", "").replace(" ", "").split(",") if m
+)
+QUOTE_MINTS = {WSOL_MINT, USDC_MINT, *EXTRA_QUOTES}
+
+# ============================================================
+# PHANTOM + JUPITER LINKS (NEW)
+# ============================================================
+PHANTOM_TOKEN_PAGE_FMT = "https://phantom.com/tokens/solana/{mint}"  # web token page
+JUPITER_SWAP_FMT = "https://jup.ag/swap/{a}-{b}"  # symbol-based (best-effort)
+
+def phantom_caip19_solana(mint: str) -> str:
+    # CAIP-19 for Solana mainnet: solana:101/address:<mint>
+    return f"solana:101/address:{mint}"
+
+def phantom_fungible_link(mint: str) -> str:
+    # Opens token detail page in Phantom app (mobile tap)
+    token = quote(phantom_caip19_solana(mint), safe="")
+    return f"https://phantom.app/ul/v1/fungible?token={token}"
+
+def phantom_swap_link(buy_mint: str = "", sell_mint: str = "") -> str:
+    # Opens Phantom swapper (mobile tap)
+    # If sell omitted -> defaults to SOL; if buy omitted -> defaults to SOL.
+    buy = quote(phantom_caip19_solana(buy_mint), safe="") if buy_mint else ""
+    sell = quote(phantom_caip19_solana(sell_mint), safe="") if sell_mint else ""
+    return f"https://phantom.app/ul/v1/swap?buy={buy}&sell={sell}"
+
+def jupiter_swap_link(symbol_in: str, symbol_out: str) -> str:
+    return JUPITER_SWAP_FMT.format(a=symbol_in, b=symbol_out)
 
 # ============================================================
 # DEXSCREENER
@@ -61,7 +91,7 @@ ENABLE_DEXSCREENER = os.getenv("ENABLE_DEXSCREENER", "1").strip().lower() not in
 DEX_CHAIN = os.getenv("DEXSCREENER_CHAIN", "solana").strip() or "solana"
 DEX_TIMEOUT = float(os.getenv("DEX_TIMEOUT", "10"))
 DEX_CACHE_TTL = int(os.getenv("DEX_CACHE_TTL", "60"))
-DEX_MIN_LIQ_USD = float(os.getenv("DEX_MIN_LIQ_USD", "2000"))
+DEX_MIN_LIQ_USD = float(os.getenv("DEX_MIN_LIQ_USD", "0"))  # set >0 if you want to filter tiny pools
 
 _dex_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 
@@ -201,12 +231,14 @@ def dex_url_from_pair(pair: Optional[Dict[str, Any]]) -> str:
 
 def dex_metrics(pair: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not pair:
-        return {"price": None, "liq": None, "vol5": None, "vol1h": None, "url": ""}
+        return {"price": None, "liq": None, "vol5": None, "vol1h": None, "url": "", "symbol": ""}
 
     price = _to_float(pair.get("priceUsd"))
     liq = _to_float((pair.get("liquidity") or {}).get("usd"))
     vol5 = _to_float((pair.get("volume") or {}).get("m5"))
     vol1h = _to_float((pair.get("volume") or {}).get("h1"))
+    base = pair.get("baseToken") or {}
+    sym = (base.get("symbol") or "").strip().upper()
 
     return {
         "price": price,
@@ -214,6 +246,7 @@ def dex_metrics(pair: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "vol5": vol5,
         "vol1h": vol1h,
         "url": dex_url_from_pair(pair),
+        "symbol": sym,
     }
 
 # ============================================================
@@ -270,7 +303,6 @@ def extract_wallets(tx: Dict[str, Any]) -> Set[str]:
 def tracked_wallet_in_tx(tx: Dict[str, Any]) -> Optional[str]:
     wallets = extract_wallets(tx)
 
-    # If WATCH_WALLETS not set, pick feePayer if possible
     if not WATCH_WALLETS:
         fp = tx.get("feePayer")
         if isinstance(fp, str):
@@ -283,8 +315,46 @@ def tracked_wallet_in_tx(tx: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ============================================================
-# FIX #1: Native SOL delta (lamports) mapped to WSOL mint
+# SWAP FLOW PARSING (events.swap) + FALLBACK (tokenTransfers + native SOL)
 # ============================================================
+def aggregate_swap_flows_for_wallet(tx: Dict[str, Any], wallet: str) -> Tuple[Dict[str, float], Dict[str, float]]:
+    spent: Dict[str, float] = {}
+    recv: Dict[str, float] = {}
+
+    ev = tx.get("events") or {}
+    swap = ev.get("swap") if isinstance(ev, dict) else None
+    if not isinstance(swap, dict):
+        return spent, recv
+
+    # Some payloads might include direct arrays too; handle both patterns
+    inner_swaps = swap.get("innerSwaps") or []
+    if not isinstance(inner_swaps, list):
+        inner_swaps = []
+
+    for ins in inner_swaps:
+        if not isinstance(ins, dict):
+            continue
+
+        for ti in (ins.get("tokenInputs") or []):
+            if not isinstance(ti, dict):
+                continue
+            if ti.get("fromUserAccount") == wallet:
+                mint = ti.get("mint") or ""
+                amt = _to_float(ti.get("tokenAmount")) or 0.0
+                if mint:
+                    spent[mint] = spent.get(mint, 0.0) + amt
+
+        for to in (ins.get("tokenOutputs") or []):
+            if not isinstance(to, dict):
+                continue
+            if to.get("toUserAccount") == wallet:
+                mint = to.get("mint") or ""
+                amt = _to_float(to.get("tokenAmount")) or 0.0
+                if mint:
+                    recv[mint] = recv.get(mint, 0.0) + amt
+
+    return spent, recv
+
 def aggregate_native_sol_delta(tx: Dict[str, Any], wallet: str) -> float:
     d = 0.0
     for nt in (tx.get("nativeTransfers") or []):
@@ -323,11 +393,7 @@ def aggregate_token_transfer_deltas(tx: Dict[str, Any], wallet: str) -> Dict[str
         if not mint:
             continue
 
-        try:
-            amt = float(tt.get("tokenAmount") or 0)
-        except Exception:
-            amt = 0.0
-
+        amt = _to_float(tt.get("tokenAmount")) or 0.0
         frm = tt.get("fromUserAccount")
         to = tt.get("toUserAccount")
 
@@ -336,16 +402,18 @@ def aggregate_token_transfer_deltas(tx: Dict[str, Any], wallet: str) -> Dict[str
         if frm == wallet:
             delta[mint] = delta.get(mint, 0.0) - amt
 
-    # Add native SOL movement as WSOL mint so BUY/SELL detection works
     sol_delta = aggregate_native_sol_delta(tx, wallet)
     if sol_delta:
         delta[WSOL_MINT] = delta.get(WSOL_MINT, 0.0) + sol_delta
 
     return delta
 
-# ============================================================
-# BUY/SELL CLASSIFICATION
-# ============================================================
+def pick_top_flow(flow: Dict[str, float]) -> Tuple[str, float]:
+    if not flow:
+        return ("", 0.0)
+    mint, amt = max(flow.items(), key=lambda kv: kv[1])
+    return mint, amt
+
 def pick_top_abs(delta: Dict[str, float], sign: int) -> Tuple[str, float]:
     items = [(m, v) for m, v in delta.items() if (v > 0 if sign > 0 else v < 0)]
     if not items:
@@ -370,15 +438,33 @@ def classify_buy_sell(tx: Dict[str, Any], wallet: str) -> Tuple[str, str, str]:
     desc = tx.get("description") or ""
     sig = tx.get("signature") or ""
 
-    # Fallback classification using deltas (tokenTransfers + native SOL mapped to WSOL)
-    delta = aggregate_token_transfer_deltas(tx, wallet)
+    # 1) Prefer events.swap when present (more accurate)
+    spent, recv = aggregate_swap_flows_for_wallet(tx, wallet)
+    if spent or recv:
+        sm, sa = pick_top_flow(spent)
+        rm, ra = pick_top_flow(recv)
 
+        meme = detect_meme_mint(sm, rm)
+
+        side = ""
+        if sm in QUOTE_MINTS and rm and rm not in QUOTE_MINTS:
+            side = "BUY"
+        elif rm in QUOTE_MINTS and sm and sm not in QUOTE_MINTS:
+            side = "SELL"
+
+        summary = desc
+        if sm and rm:
+            summary = f"Spent {sa:g} {short_addr(sm)} | Received {ra:g} {short_addr(rm)}"
+
+        return side, summary, meme
+
+    # 2) Fallback: tokenTransfers + native SOL mapped to WSOL
+    delta = aggregate_token_transfer_deltas(tx, wallet)
     if not delta:
         return "", (desc or f"Sig: {short_addr(sig)}"), ""
 
     spent_mint, spent_amt = pick_top_abs(delta, -1)
     recv_mint, recv_amt = pick_top_abs(delta, +1)
-
     meme = detect_meme_mint(spent_mint, recv_mint)
 
     side = ""
@@ -387,15 +473,14 @@ def classify_buy_sell(tx: Dict[str, Any], wallet: str) -> Tuple[str, str, str]:
     elif recv_mint in QUOTE_MINTS and spent_mint and spent_mint not in QUOTE_MINTS:
         side = "SELL"
 
+    summary = desc
     if spent_mint and recv_mint:
         summary = f"Spent {spent_amt:g} {short_addr(spent_mint)} | Received {recv_amt:g} {short_addr(recv_mint)}"
-    else:
-        summary = desc or f"Sig: {short_addr(sig)}"
 
     return side, summary, meme
 
 # ============================================================
-# MESSAGE BUILDER
+# MESSAGE BUILDER (BUY/SELL alerts + NEW LINKS)
 # ============================================================
 def build_trade_message(tx: Dict[str, Any], wallet: str) -> str:
     sig = tx.get("signature") or ""
@@ -421,23 +506,45 @@ def build_trade_message(tx: Dict[str, Any], wallet: str) -> str:
     if tx_type:
         lines.append(f"Type: {tx_type}")
 
-    # Dexscreener enrichment
-    if ENABLE_DEXSCREENER and meme_mint:
-        try:
-            pair = dexscreener_best_pair(meme_mint, force=True)
-            m = dex_metrics(pair)
-            if m["url"]:
-                lines.append(f"Dexscreener: {m['url']}")
-            if m["price"] is not None and m["liq"] is not None:
-                lines.append(f"Price: ${m['price']:,.8f} | Liquidity: ${m['liq']:,.0f}")
-            if m["vol5"] is not None or m["vol1h"] is not None:
-                v5 = f"${m['vol5']:,.0f}" if m["vol5"] is not None else "?"
-                v1 = f"${m['vol1h']:,.0f}" if m["vol1h"] is not None else "?"
-                lines.append(f"Vol(5m): {v5} | Vol(1h): {v1}")
-            lines.append(f"Mint: {meme_mint}")
-        except Exception:
-            lines.append(f"Mint: {meme_mint}")
-            lines.append("Dexscreener: (lookup failed)")
+    # Dexscreener enrichment (+ Phantom + Jupiter links)
+    if meme_mint:
+        # Phantom web token page + Phantom in-app token page
+        lines.append(f"Phantom token: {PHANTOM_TOKEN_PAGE_FMT.format(mint=meme_mint)}")
+        lines.append(f"Phantom (in-app): {phantom_fungible_link(meme_mint)}")
+
+        # Phantom swap deeplink (tap on mobile)
+        if side == "BUY":
+            # Buy token with SOL (sell defaults to SOL if omitted)
+            lines.append(f"Phantom swap: {phantom_swap_link(buy_mint=meme_mint)}")
+        else:
+            # Sell token to SOL (buy defaults to SOL if omitted)
+            lines.append(f"Phantom swap: {phantom_swap_link(sell_mint=meme_mint)}")
+
+        if ENABLE_DEXSCREENER:
+            try:
+                pair = dexscreener_best_pair(meme_mint, force=True)
+                m = dex_metrics(pair)
+
+                if m["url"]:
+                    lines.append(f"Dexscreener: {m['url']}")
+                if m["price"] is not None and m["liq"] is not None:
+                    lines.append(f"Price: ${m['price']:,.8f} | Liquidity: ${m['liq']:,.0f}")
+                if m["vol5"] is not None or m["vol1h"] is not None:
+                    v5 = f"${m['vol5']:,.0f}" if m["vol5"] is not None else "?"
+                    v1 = f"${m['vol1h']:,.0f}" if m["vol1h"] is not None else "?"
+                    lines.append(f"Vol(5m): {v5} | Vol(1h): {v1}")
+
+                # Jupiter link (symbol-based; best-effort)
+                sym = (m.get("symbol") or "").strip().upper()
+                if sym:
+                    if side == "BUY":
+                        lines.append(f"Jupiter: {jupiter_swap_link('SOL', sym)}")
+                    else:
+                        lines.append(f"Jupiter: {jupiter_swap_link(sym, 'SOL')}")
+            except Exception:
+                lines.append("Dexscreener: (lookup failed)")
+
+        lines.append(f"Mint: {meme_mint}")
 
     if sig:
         lines.append(f"Sig: {sig}")
@@ -454,7 +561,7 @@ app = FastAPI()
 def _startup():
     threading.Thread(target=tg_worker, daemon=True).start()
     TG_QUEUE.put(
-        "✅ Service started (BUY/SELL mode + SOL-native swap fix).\n"
+        "✅ Service started (BUY/SELL + Dexscreener + Phantom/Jupiter links).\n"
         f"WATCH_WALLETS: {len(WATCH_WALLETS)} loaded\n"
         f"ALLOWED_TYPES: {('ALL' if not ALLOWED_TYPES else ','.join(sorted(ALLOWED_TYPES)))}\n"
         f"DEX_CACHE_TTL: {DEX_CACHE_TTL}s\n"
@@ -538,7 +645,6 @@ async def helius_webhook(request: Request):
 
             msg = build_trade_message(tx, wallet)
             if not msg:
-                # FIX #2: log why empty (safe snippet)
                 reasons["ignored"] += 1
                 reasons["empty_msg"] += 1
                 log.info(
@@ -558,4 +664,3 @@ async def helius_webhook(request: Request):
 
     log.info("helius_summary=%s", json.dumps(reasons, separators=(",", ":")))
     return JSONResponse({"ok": True, **reasons})
-
