@@ -29,12 +29,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 HELIUS_AUTH_HEADER = os.getenv("HELIUS_AUTH_HEADER", "").strip()
 
-# If empty, allow ALL tx types (recommended to avoid missing trades)
+# If empty -> accept ALL tx types (recommended). You still only ALERT on BUY/SELL.
 ALLOWED_TYPES = set(
     t for t in os.getenv("ALLOWED_TYPES", "").replace(" ", "").split(",") if t
 )
-
-CLASSIFY_SWAPS = os.getenv("CLASSIFY_SWAPS", "1").strip().lower() not in ("0", "false", "no")
 
 TG_MSG_INTERVAL = float(os.getenv("TG_MSG_INTERVAL", "0.75"))
 
@@ -48,21 +46,10 @@ def is_tracked(wallet: str) -> bool:
     return (not WATCH_WALLETS) or (wallet in WATCH_WALLETS)
 
 # ============================================================
-# HOLD MODE (30–60 min)
+# SOLANA CONSTANTS
 # ============================================================
-HOLD_MODE = os.getenv("HOLD_MODE", "1").strip().lower() not in ("0", "false", "no")
-HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "60"))
-HOLD_UPDATE_MINUTES = int(os.getenv("HOLD_UPDATE_MINUTES", "10"))
-HOLD_POLL_SECONDS = int(os.getenv("HOLD_POLL_SECONDS", "60"))
+LAMPORTS_PER_SOL = 1_000_000_000
 
-HOLD_TRAIL_STOP_PCT = float(os.getenv("HOLD_TRAIL_STOP_PCT", "0.18"))
-HOLD_LIQ_DROP_PCT = float(os.getenv("HOLD_LIQ_DROP_PCT", "0.25"))
-
-HOLD_MAX_WATCHES = int(os.getenv("HOLD_MAX_WATCHES", "100"))
-
-# ============================================================
-# SOLANA QUOTE MINTS (for BUY/SELL classification)
-# ============================================================
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 QUOTE_MINTS = {WSOL_MINT, USDC_MINT}
@@ -73,7 +60,7 @@ QUOTE_MINTS = {WSOL_MINT, USDC_MINT}
 ENABLE_DEXSCREENER = os.getenv("ENABLE_DEXSCREENER", "1").strip().lower() not in ("0", "false", "no")
 DEX_CHAIN = os.getenv("DEXSCREENER_CHAIN", "solana").strip() or "solana"
 DEX_TIMEOUT = float(os.getenv("DEX_TIMEOUT", "10"))
-DEX_CACHE_TTL = int(os.getenv("DEX_CACHE_TTL", "60"))  # keep fresh for holds
+DEX_CACHE_TTL = int(os.getenv("DEX_CACHE_TTL", "60"))
 DEX_MIN_LIQ_USD = float(os.getenv("DEX_MIN_LIQ_USD", "2000"))
 
 _dex_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
@@ -170,9 +157,6 @@ def _to_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def now_ts() -> float:
-    return time.time()
-
 # ============================================================
 # DEXSCREENER HELPERS
 # ============================================================
@@ -187,7 +171,7 @@ def dexscreener_best_pair(mint: str, force: bool = False) -> Optional[Dict[str, 
     if not ENABLE_DEXSCREENER or not mint:
         return None
 
-    now = now_ts()
+    now = time.time()
     hit = _dex_cache.get(mint)
     if (not force) and hit and hit[0] > now:
         return hit[1]
@@ -217,30 +201,23 @@ def dex_url_from_pair(pair: Optional[Dict[str, Any]]) -> str:
 
 def dex_metrics(pair: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not pair:
-        return {
-            "price": None, "liq": None, "vol5": None, "vol1h": None, "chg5": None,
-            "txns5": None, "url": ""
-        }
+        return {"price": None, "liq": None, "vol5": None, "vol1h": None, "url": ""}
+
     price = _to_float(pair.get("priceUsd"))
     liq = _to_float((pair.get("liquidity") or {}).get("usd"))
     vol5 = _to_float((pair.get("volume") or {}).get("m5"))
     vol1h = _to_float((pair.get("volume") or {}).get("h1"))
-    chg5 = _to_float((pair.get("priceChange") or {}).get("m5"))
-    txns5 = (pair.get("txns") or {}).get("m5") or {}
-    buys = int(txns5.get("buys") or 0)
-    sells = int(txns5.get("sells") or 0)
+
     return {
         "price": price,
         "liq": liq,
         "vol5": vol5,
         "vol1h": vol1h,
-        "chg5": chg5,
-        "txns5": buys + sells,
         "url": dex_url_from_pair(pair),
     }
 
 # ============================================================
-# WALLET + SWAP FLOW PARSING
+# WALLET EXTRACTION
 # ============================================================
 def extract_wallets(tx: Dict[str, Any]) -> Set[str]:
     wallets: Set[str] = set()
@@ -293,6 +270,7 @@ def extract_wallets(tx: Dict[str, Any]) -> Set[str]:
 def tracked_wallet_in_tx(tx: Dict[str, Any]) -> Optional[str]:
     wallets = extract_wallets(tx)
 
+    # If WATCH_WALLETS not set, pick feePayer if possible
     if not WATCH_WALLETS:
         fp = tx.get("feePayer")
         if isinstance(fp, str):
@@ -304,59 +282,71 @@ def tracked_wallet_in_tx(tx: Dict[str, Any]) -> Optional[str]:
             return w
     return None
 
-def aggregate_swap_flows_for_wallet(tx: Dict[str, Any], wallet: str) -> Tuple[Dict[str, float], Dict[str, float]]:
-    spent: Dict[str, float] = {}
-    recv: Dict[str, float] = {}
+# ============================================================
+# FIX #1: Native SOL delta (lamports) mapped to WSOL mint
+# ============================================================
+def aggregate_native_sol_delta(tx: Dict[str, Any], wallet: str) -> float:
+    d = 0.0
+    for nt in (tx.get("nativeTransfers") or []):
+        if not isinstance(nt, dict):
+            continue
 
-    ev = tx.get("events") or {}
-    swap = ev.get("swap") if isinstance(ev, dict) else None
-    if not isinstance(swap, dict):
-        return spent, recv
+        amt = nt.get("amount")  # usually lamports in Helius enhanced tx
+        if amt is None:
+            continue
 
-    for ins in (swap.get("innerSwaps") or []):
-        for ti in (ins.get("tokenInputs") or []):
-            if isinstance(ti, dict) and ti.get("fromUserAccount") == wallet:
-                mint = ti.get("mint") or "unknown"
-                amt = float(ti.get("tokenAmount") or 0)
-                spent[mint] = spent.get(mint, 0.0) + amt
+        try:
+            lamports = float(amt)
+        except Exception:
+            continue
 
-        for to in (ins.get("tokenOutputs") or []):
-            if isinstance(to, dict) and to.get("toUserAccount") == wallet:
-                mint = to.get("mint") or "unknown"
-                amt = float(to.get("tokenAmount") or 0)
-                recv[mint] = recv.get(mint, 0.0) + amt
+        sol = lamports / LAMPORTS_PER_SOL
 
-    return spent, recv
+        if nt.get("toUserAccount") == wallet:
+            d += sol
+        if nt.get("fromUserAccount") == wallet:
+            d -= sol
+
+    return d
 
 def aggregate_token_transfer_deltas(tx: Dict[str, Any], wallet: str) -> Dict[str, float]:
     """
-    Fallback when events.swap is missing.
-    Computes net token delta per mint for this wallet using tokenTransfers.
+    Net token delta per mint for this wallet using tokenTransfers,
+    PLUS native SOL delta mapped to WSOL mint.
     """
     delta: Dict[str, float] = {}
+
     for tt in (tx.get("tokenTransfers") or []):
         if not isinstance(tt, dict):
             continue
         mint = tt.get("mint") or ""
-        amt = float(tt.get("tokenAmount") or 0)
+        if not mint:
+            continue
+
+        try:
+            amt = float(tt.get("tokenAmount") or 0)
+        except Exception:
+            amt = 0.0
+
         frm = tt.get("fromUserAccount")
         to = tt.get("toUserAccount")
-        # wallet receives
-        if to == wallet and mint:
+
+        if to == wallet:
             delta[mint] = delta.get(mint, 0.0) + amt
-        # wallet sends
-        if frm == wallet and mint:
+        if frm == wallet:
             delta[mint] = delta.get(mint, 0.0) - amt
+
+    # Add native SOL movement as WSOL mint so BUY/SELL detection works
+    sol_delta = aggregate_native_sol_delta(tx, wallet)
+    if sol_delta:
+        delta[WSOL_MINT] = delta.get(WSOL_MINT, 0.0) + sol_delta
+
     return delta
 
-def pick_top_flow(flow: Dict[str, float]) -> Tuple[str, float]:
-    if not flow:
-        return ("", 0.0)
-    mint, amt = max(flow.items(), key=lambda kv: kv[1])
-    return mint, amt
-
+# ============================================================
+# BUY/SELL CLASSIFICATION
+# ============================================================
 def pick_top_abs(delta: Dict[str, float], sign: int) -> Tuple[str, float]:
-    # sign: +1 for received (positive), -1 for spent (negative)
     items = [(m, v) for m, v in delta.items() if (v > 0 if sign > 0 else v < 0)]
     if not items:
         return ("", 0.0)
@@ -377,208 +367,37 @@ def classify_buy_sell(tx: Dict[str, Any], wallet: str) -> Tuple[str, str, str]:
     Returns (side, summary, meme_mint)
     side: BUY or SELL if classified, else "" (ignored)
     """
-    tx_type = (tx.get("type") or "").upper()
     desc = tx.get("description") or ""
     sig = tx.get("signature") or ""
 
-    # 1) Prefer events.swap
-    spent, recv = aggregate_swap_flows_for_wallet(tx, wallet)
-    if spent or recv:
-        sm, sa = pick_top_flow(spent)
-        rm, ra = pick_top_flow(recv)
-
-        meme = detect_meme_mint(sm, rm)
-        side = ""
-        if sm in QUOTE_MINTS and rm and rm not in QUOTE_MINTS:
-            side = "BUY"
-        elif rm in QUOTE_MINTS and sm and sm not in QUOTE_MINTS:
-            side = "SELL"
-
-        summary = f"Spent {sa:g} {short_addr(sm)} | Received {ra:g} {short_addr(rm)}" if sm and rm else (desc or "")
-        return side, summary, meme
-
-    # 2) Fallback: tokenTransfers net deltas
+    # Fallback classification using deltas (tokenTransfers + native SOL mapped to WSOL)
     delta = aggregate_token_transfer_deltas(tx, wallet)
-    if delta:
-        spent_mint, spent_amt = pick_top_abs(delta, -1)
-        recv_mint, recv_amt = pick_top_abs(delta, +1)
-        meme = detect_meme_mint(spent_mint, recv_mint)
 
-        side = ""
-        if spent_mint in QUOTE_MINTS and recv_mint and recv_mint not in QUOTE_MINTS:
-            side = "BUY"
-        elif recv_mint in QUOTE_MINTS and spent_mint and spent_mint not in QUOTE_MINTS:
-            side = "SELL"
+    if not delta:
+        return "", (desc or f"Sig: {short_addr(sig)}"), ""
 
-        summary = ""
-        if spent_mint and recv_mint:
-            summary = f"Spent {spent_amt:g} {short_addr(spent_mint)} | Received {recv_amt:g} {short_addr(recv_mint)}"
-        else:
-            summary = desc or f"Sig: {short_addr(sig)}"
-        return side, summary, meme
+    spent_mint, spent_amt = pick_top_abs(delta, -1)
+    recv_mint, recv_amt = pick_top_abs(delta, +1)
 
-    # If we can't classify -> ignore
-    return "", (desc or f"Sig: {short_addr(sig)}"), ""
+    meme = detect_meme_mint(spent_mint, recv_mint)
 
-# ============================================================
-# HOLD WATCH STATE
-# ============================================================
-WATCH_LOCK = threading.Lock()
-hold_watches: Dict[str, Dict[str, Any]] = {}
+    side = ""
+    if spent_mint in QUOTE_MINTS and recv_mint and recv_mint not in QUOTE_MINTS:
+        side = "BUY"
+    elif recv_mint in QUOTE_MINTS and spent_mint and spent_mint not in QUOTE_MINTS:
+        side = "SELL"
 
-def watch_id(wallet: str, mint: str) -> str:
-    return f"{wallet}:{mint}"
+    if spent_mint and recv_mint:
+        summary = f"Spent {spent_amt:g} {short_addr(spent_mint)} | Received {recv_amt:g} {short_addr(recv_mint)}"
+    else:
+        summary = desc or f"Sig: {short_addr(sig)}"
 
-def start_hold_watch(wallet: str, mint: str, entry_price: float, dex_url: str, entry_sig: str):
-    if not HOLD_MODE:
-        return
-    if not mint or not entry_price:
-        return
-
-    wid = watch_id(wallet, mint)
-    now = now_ts()
-
-    with WATCH_LOCK:
-        # cap total watches
-        if len(hold_watches) >= HOLD_MAX_WATCHES:
-            # drop the oldest by started_at
-            oldest = min(hold_watches.items(), key=lambda kv: kv[1].get("started_at", now))[0]
-            hold_watches.pop(oldest, None)
-
-        hold_watches[wid] = {
-            "wallet": wallet,
-            "mint": mint,
-            "entry_price": entry_price,
-            "peak_price": entry_price,
-            "last_price": entry_price,
-            "dex_url": dex_url,
-            "entry_sig": entry_sig,
-            "started_at": now,
-            "expires_at": now + HOLD_MINUTES * 60,
-            "next_update_at": now + HOLD_UPDATE_MINUTES * 60,
-            "entry_liq": None,  # set on first refresh if available
-        }
-
-def end_hold_watch(wid: str):
-    with WATCH_LOCK:
-        hold_watches.pop(wid, None)
-
-def pct(a: float, b: float) -> float:
-    if a <= 0:
-        return 0.0
-    return ((b / a) - 1.0) * 100.0
-
-def hold_worker():
-    while True:
-        try:
-            now = now_ts()
-            to_end: List[str] = []
-            updates: List[Tuple[str, str]] = []
-
-            with WATCH_LOCK:
-                items = list(hold_watches.items())
-
-            for wid, w in items:
-                if now >= w["expires_at"]:
-                    # time stop
-                    updates.append((wid, "⏱️ HOLD END (time stop reached)"))
-                    to_end.append(wid)
-                    continue
-
-                # refresh dexscreener
-                pair = dexscreener_best_pair(w["mint"], force=True)
-                m = dex_metrics(pair)
-                price = m["price"]
-                liq = m["liq"]
-
-                if price is None:
-                    # can't update; skip
-                    continue
-
-                w["last_price"] = price
-                if price > w["peak_price"]:
-                    w["peak_price"] = price
-
-                if w["entry_liq"] is None and liq is not None:
-                    w["entry_liq"] = liq
-
-                # trailing stop
-                trail_floor = w["peak_price"] * (1.0 - HOLD_TRAIL_STOP_PCT)
-                if price <= trail_floor:
-                    updates.append((wid, f"🟠 HOLD EXIT SIGNAL (trail stop {int(HOLD_TRAIL_STOP_PCT*100)}% hit)"))
-                    to_end.append(wid)
-                    continue
-
-                # liquidity drop warning/exit
-                if w["entry_liq"] is not None and liq is not None and w["entry_liq"] > 0:
-                    if liq <= w["entry_liq"] * (1.0 - HOLD_LIQ_DROP_PCT):
-                        updates.append((wid, f"🟠 HOLD EXIT SIGNAL (liquidity dropped {int(HOLD_LIQ_DROP_PCT*100)}%+)"))
-                        to_end.append(wid)
-                        continue
-
-                # periodic update
-                if now >= w["next_update_at"]:
-                    updates.append((wid, "📈 HOLD UPDATE"))
-                    w["next_update_at"] = now + HOLD_UPDATE_MINUTES * 60
-
-                # write back updated watch
-                with WATCH_LOCK:
-                    if wid in hold_watches:
-                        hold_watches[wid].update(w)
-
-            # send updates
-            for wid, headline in updates:
-                with WATCH_LOCK:
-                    w = hold_watches.get(wid)
-                if not w:
-                    continue
-
-                pair = dexscreener_best_pair(w["mint"], force=True)
-                m = dex_metrics(pair)
-                cur = m["price"] or w["last_price"]
-                entry = w["entry_price"]
-                peak = w["peak_price"]
-
-                mins_in = int((now_ts() - w["started_at"]) / 60)
-                pnl = pct(entry, cur)
-                peak_pnl = pct(entry, peak)
-
-                msg = (
-                    f"{headline}\n"
-                    f"Wallet: {w['wallet']}\n"
-                    f"Mint: {w['mint']}\n"
-                    f"Minutes in: {mins_in}m / {HOLD_MINUTES}m\n"
-                    f"Entry: ${entry:,.8f}\n"
-                    f"Now:   ${cur:,.8f}  ({pnl:+.1f}%)\n"
-                    f"Peak:  ${peak:,.8f} ({peak_pnl:+.1f}%)\n"
-                )
-                if m["liq"] is not None:
-                    msg += f"Liquidity: ${m['liq']:,.0f}\n"
-                if m["vol5"] is not None or m["vol1h"] is not None:
-                    v5 = f"${m['vol5']:,.0f}" if m["vol5"] is not None else "?"
-                    v1 = f"${m['vol1h']:,.0f}" if m["vol1h"] is not None else "?"
-                    msg += f"Vol(5m): {v5} | Vol(1h): {v1}\n"
-                if m["url"]:
-                    msg += f"Dexscreener: {m['url']}\n"
-
-                TG_QUEUE.put(msg)
-
-            for wid in to_end:
-                end_hold_watch(wid)
-
-        except Exception as e:
-            log.exception("hold_worker error: %s", e)
-
-        time.sleep(HOLD_POLL_SECONDS)
+    return side, summary, meme
 
 # ============================================================
-# MESSAGE BUILDER (BUY/SELL alerts)
+# MESSAGE BUILDER
 # ============================================================
-def build_trade_message(tx: Dict[str, Any], wallet: str) -> Tuple[str, Optional[str], Optional[float], str]:
-    """
-    Returns:
-      text, meme_mint, entry_price, dex_url
-    """
+def build_trade_message(tx: Dict[str, Any], wallet: str) -> str:
     sig = tx.get("signature") or ""
     desc = tx.get("description") or ""
     source = tx.get("source") or ""
@@ -586,15 +405,15 @@ def build_trade_message(tx: Dict[str, Any], wallet: str) -> Tuple[str, Optional[
 
     side, summary, meme_mint = classify_buy_sell(tx, wallet)
     if side not in ("BUY", "SELL"):
-        return "", None, None, ""
+        return ""
 
     label = "🟢 BUY" if side == "BUY" else "🔴 SELL"
     lines = [
         f"{label}  WALLET TRADE",
         f"Wallet: {wallet}",
+        summary,
     ]
-    if summary:
-        lines.append(summary)
+
     if desc and desc != summary:
         lines.append(f"Desc: {desc}")
     if source:
@@ -602,34 +421,29 @@ def build_trade_message(tx: Dict[str, Any], wallet: str) -> Tuple[str, Optional[
     if tx_type:
         lines.append(f"Type: {tx_type}")
 
-    entry_price = None
-    dex_url = ""
+    # Dexscreener enrichment
     if ENABLE_DEXSCREENER and meme_mint:
         try:
             pair = dexscreener_best_pair(meme_mint, force=True)
             m = dex_metrics(pair)
-            dex_url = m["url"]
-            if dex_url:
-                lines.append(f"Dexscreener: {dex_url}")
+            if m["url"]:
+                lines.append(f"Dexscreener: {m['url']}")
             if m["price"] is not None and m["liq"] is not None:
                 lines.append(f"Price: ${m['price']:,.8f} | Liquidity: ${m['liq']:,.0f}")
-                entry_price = m["price"]
             if m["vol5"] is not None or m["vol1h"] is not None:
                 v5 = f"${m['vol5']:,.0f}" if m["vol5"] is not None else "?"
                 v1 = f"${m['vol1h']:,.0f}" if m["vol1h"] is not None else "?"
-                lines.append(f"Vol(5m) {v5} | Vol(1h) {v1}")
-            if meme_mint:
-                lines.append(f"Mint: {meme_mint}")
+                lines.append(f"Vol(5m): {v5} | Vol(1h): {v1}")
+            lines.append(f"Mint: {meme_mint}")
         except Exception:
+            lines.append(f"Mint: {meme_mint}")
             lines.append("Dexscreener: (lookup failed)")
-            if meme_mint:
-                lines.append(f"Mint: {meme_mint}")
 
     if sig:
         lines.append(f"Sig: {sig}")
         lines.append(f"https://solscan.io/tx/{sig}")
 
-    return "\n".join(lines), meme_mint, entry_price, dex_url
+    return "\n".join(lines)
 
 # ============================================================
 # FASTAPI
@@ -639,22 +453,17 @@ app = FastAPI()
 @app.on_event("startup")
 def _startup():
     threading.Thread(target=tg_worker, daemon=True).start()
-    if HOLD_MODE:
-        threading.Thread(target=hold_worker, daemon=True).start()
-
     TG_QUEUE.put(
-        "✅ Service started (BUY/SELL alerts + Hold Watch mode).\n"
+        "✅ Service started (BUY/SELL mode + SOL-native swap fix).\n"
         f"WATCH_WALLETS: {len(WATCH_WALLETS)} loaded\n"
         f"ALLOWED_TYPES: {('ALL' if not ALLOWED_TYPES else ','.join(sorted(ALLOWED_TYPES)))}\n"
-        f"CLASSIFY_SWAPS: {CLASSIFY_SWAPS}\n"
-        f"HOLD_MODE: {HOLD_MODE} ({HOLD_MINUTES}m, updates every {HOLD_UPDATE_MINUTES}m)\n"
         f"DEX_CACHE_TTL: {DEX_CACHE_TTL}s\n"
         f"TG_MSG_INTERVAL: {TG_MSG_INTERVAL:.2f}s"
     )
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "wallet-webhook", "mode": "buy/sell + hold_watch"}
+    return {"ok": True, "service": "wallet-webhook", "mode": "buy/sell"}
 
 @app.get("/health")
 def health():
@@ -677,6 +486,7 @@ async def helius_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # Helius commonly sends a JSON list
     if isinstance(body, list):
         txs = body
     elif isinstance(body, dict) and isinstance(body.get("transactions"), list):
@@ -694,7 +504,6 @@ async def helius_webhook(request: Request):
         "untracked": 0,
         "empty_msg": 0,
         "exceptions": 0,
-        "hold_started": 0,
     }
 
     for tx in txs:
@@ -711,8 +520,6 @@ async def helius_webhook(request: Request):
                 continue
 
             tx_type = (tx.get("type") or "").upper()
-
-            # If ALLOWED_TYPES is empty -> allow all
             if ALLOWED_TYPES and tx_type and tx_type not in ALLOWED_TYPES:
                 reasons["ignored"] += 1
                 reasons["bad_type"] += 1
@@ -729,19 +536,21 @@ async def helius_webhook(request: Request):
                 reasons["untracked"] += 1
                 continue
 
-            msg, meme_mint, entry_price, dex_url = build_trade_message(tx, wallet)
+            msg = build_trade_message(tx, wallet)
             if not msg:
+                # FIX #2: log why empty (safe snippet)
                 reasons["ignored"] += 1
                 reasons["empty_msg"] += 1
+                log.info(
+                    "empty_msg_debug sig=%s type=%s desc=%s",
+                    tx.get("signature", ""),
+                    (tx.get("type") or ""),
+                    (tx.get("description") or "")[:160],
+                )
                 continue
 
             TG_QUEUE.put(msg)
             reasons["sent"] += 1
-
-            # Start 30–60 min hold watch only on BUY
-            if HOLD_MODE and msg.startswith("🟢 BUY") and meme_mint and entry_price:
-                start_hold_watch(wallet, meme_mint, entry_price, dex_url, sig)
-                reasons["hold_started"] += 1
 
         except Exception:
             reasons["ignored"] += 1
