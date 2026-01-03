@@ -1,666 +1,367 @@
 # app.py
 import os
-import time
 import json
+import time
+import hmac
+import hashlib
 import logging
-import threading
-from queue import SimpleQueue
-from collections import deque
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict, deque
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, Response
-
-# ============================================================
-# LOGGING
-# ============================================================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("wallet-webhook")
 
-# ============================================================
-# ENV
-# ============================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-HELIUS_AUTH_HEADER = os.getenv("HELIUS_AUTH_HEADER", "").strip()
+# -----------------------------
+# ENV helpers
+# -----------------------------
+def getenv_required(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
-# If empty -> accept ALL tx types. You still only ALERT on BUY/SELL.
-ALLOWED_TYPES = set(
-    t for t in os.getenv("ALLOWED_TYPES", "").replace(" ", "").split(",") if t
-)
+def parse_wallets(env_name: str) -> set[str]:
+    raw = os.getenv(env_name, "")
+    return set(w for w in raw.replace(" ", "").split(",") if w)
 
-TG_MSG_INTERVAL = float(os.getenv("TG_MSG_INTERVAL", "0.75"))
+# -----------------------------
+# Telegram
+# -----------------------------
+TELEGRAM_BOT_TOKEN = getenv_required("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = int(getenv_required("TELEGRAM_CHAT_ID"))
 
-# ---- Track wallets (your snippet) ----
-WATCH_WALLETS = set(
-    w for w in os.getenv("WATCH_WALLETS", "").replace(" ", "").split(",") if w
-)
+TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+tg = requests.Session()
 
-def is_tracked(wallet: str) -> bool:
-    # If you forgot to set WATCH_WALLETS, don't block everything
-    return (not WATCH_WALLETS) or (wallet in WATCH_WALLETS)
-
-# ============================================================
-# SOLANA CONSTANTS
-# ============================================================
-LAMPORTS_PER_SOL = 1_000_000_000
-
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-
-EXTRA_QUOTES = set(
-    m for m in os.getenv("QUOTE_MINTS_EXTRA", "").replace(" ", "").split(",") if m
-)
-QUOTE_MINTS = {WSOL_MINT, USDC_MINT, *EXTRA_QUOTES}
-
-# ============================================================
-# PHANTOM + JUPITER LINKS (NEW)
-# ============================================================
-PHANTOM_TOKEN_PAGE_FMT = "https://phantom.com/tokens/solana/{mint}"  # web token page
-JUPITER_SWAP_FMT = "https://jup.ag/swap/{a}-{b}"  # symbol-based (best-effort)
-
-def phantom_caip19_solana(mint: str) -> str:
-    # CAIP-19 for Solana mainnet: solana:101/address:<mint>
-    return f"solana:101/address:{mint}"
-
-def phantom_fungible_link(mint: str) -> str:
-    # Opens token detail page in Phantom app (mobile tap)
-    token = quote(phantom_caip19_solana(mint), safe="")
-    return f"https://phantom.app/ul/v1/fungible?token={token}"
-
-def phantom_swap_link(buy_mint: str = "", sell_mint: str = "") -> str:
-    # Opens Phantom swapper (mobile tap)
-    # If sell omitted -> defaults to SOL; if buy omitted -> defaults to SOL.
-    buy = quote(phantom_caip19_solana(buy_mint), safe="") if buy_mint else ""
-    sell = quote(phantom_caip19_solana(sell_mint), safe="") if sell_mint else ""
-    return f"https://phantom.app/ul/v1/swap?buy={buy}&sell={sell}"
-
-def jupiter_swap_link(symbol_in: str, symbol_out: str) -> str:
-    return JUPITER_SWAP_FMT.format(a=symbol_in, b=symbol_out)
-
-# ============================================================
-# DEXSCREENER
-# ============================================================
-ENABLE_DEXSCREENER = os.getenv("ENABLE_DEXSCREENER", "1").strip().lower() not in ("0", "false", "no")
-DEX_CHAIN = os.getenv("DEXSCREENER_CHAIN", "solana").strip() or "solana"
-DEX_TIMEOUT = float(os.getenv("DEX_TIMEOUT", "10"))
-DEX_CACHE_TTL = int(os.getenv("DEX_CACHE_TTL", "60"))
-DEX_MIN_LIQ_USD = float(os.getenv("DEX_MIN_LIQ_USD", "0"))  # set >0 if you want to filter tiny pools
-
-_dex_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
-
-# ============================================================
-# HTTP SESSIONS (retries)
-# ============================================================
-def make_retrying_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False,
+def tg_send(text: str, silent: bool = False) -> None:
+    r = tg.post(
+        f"{TG_BASE}/sendMessage",
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_notification": bool(silent),
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
     )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-tg_http = make_retrying_session()
-dex_http = make_retrying_session()
-
-# ============================================================
-# TELEGRAM QUEUE
-# ============================================================
-TG_QUEUE: "SimpleQueue[str]" = SimpleQueue()
-
-def telegram_send(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID).")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": False,
-    }
-    r = tg_http.post(url, json=payload, timeout=20)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
+        raise RuntimeError(data)
 
-def tg_worker():
-    last = 0.0
-    while True:
-        msg = TG_QUEUE.get()
-        now = time.time()
-        wait = (last + TG_MSG_INTERVAL) - now
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            telegram_send(msg)
-        except Exception as e:
-            log.exception("Telegram send failed: %s", e)
-        last = time.time()
+# -----------------------------
+# Watchlists
+# -----------------------------
+WATCH_WALLETS_SOL = parse_wallets("WATCH_WALLETS_SOL")                 # base58
+WATCH_WALLETS_EVM = {w.lower() for w in parse_wallets("WATCH_WALLETS_EVM")}  # 0x...
 
-# ============================================================
-# DEDUPE (Helius retries)
-# ============================================================
-SEEN_MAX = int(os.getenv("SEEN_MAX", "6000"))
-_seen_deque = deque(maxlen=SEEN_MAX)
-_seen_set: Set[str] = set()
+# If you forgot to set WATCH_WALLETS_*, don't block everything (your requested behavior)
+def is_tracked_evm(wallet: str) -> bool:
+    wallet = (wallet or "").lower()
+    return (not WATCH_WALLETS_EVM) or (wallet in WATCH_WALLETS_EVM)
 
-def seen(signature: str) -> bool:
-    if not signature:
+# -----------------------------
+# Optional header secret checks
+# (Helius commonly uses Authorization header via authHeader;
+#  Alchemy uses signature verification instead, but you can also set a secret if you want.)
+# -----------------------------
+SOLANA_WEBHOOK_SECRET = os.getenv("SOLANA_WEBHOOK_SECRET", os.getenv("WEBHOOK_SECRET", "")).strip()
+EVM_WEBHOOK_SECRET = os.getenv("EVM_WEBHOOK_SECRET", "").strip()
+
+def check_secret(auth_header: Optional[str], expected: str) -> None:
+    if not expected:
+        return
+    if not auth_header or auth_header.strip() != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# -----------------------------
+# Alchemy signature verification (NEW)
+# -----------------------------
+ALCHEMY_SIGNING_KEY = os.getenv("ALCHEMY_SIGNING_KEY", "").encode()
+
+def verify_alchemy_signature(raw_body: bytes, sig_header: Optional[str]) -> None:
+    """
+    Alchemy sends X-Alchemy-Signature. You verify HMAC-SHA256 of the raw body using your signing key.
+    If ALCHEMY_SIGNING_KEY is not set, we won't block (good for initial testing).
+    """
+    if not ALCHEMY_SIGNING_KEY:
+        return
+
+    if not sig_header:
+        raise HTTPException(status_code=401, detail="Missing X-Alchemy-Signature")
+
+    sig = sig_header.strip()
+    if sig.startswith("sha256="):
+        sig = sig.split("=", 1)[1].strip()
+
+    expected = hmac.new(ALCHEMY_SIGNING_KEY, raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+# -----------------------------
+# Dedupe (prevents double alerts)
+# -----------------------------
+DEDUP_MAX = int(os.getenv("DEDUP_MAX", "50000"))
+_dedupe = set()
+_dedupe_q = deque(maxlen=DEDUP_MAX)
+
+def remember_once(key: str) -> bool:
+    if key in _dedupe:
         return False
-    if signature in _seen_set:
-        return True
-    _seen_deque.append(signature)
-    _seen_set.add(signature)
-    if len(_seen_deque) == _seen_deque.maxlen:
-        _seen_set.clear()
-        _seen_set.update(_seen_deque)
-    return False
+    _dedupe.add(key)
+    _dedupe_q.append(key)
+    while len(_dedupe) > _dedupe_q.maxlen:
+        old = _dedupe_q.popleft()
+        _dedupe.discard(old)
+    return True
 
-# ============================================================
-# UTILS
-# ============================================================
-def short_addr(a: str, n: int = 6) -> str:
-    if not a or len(a) <= (n * 2 + 3):
-        return a
-    return f"{a[:n]}...{a[-n:]}"
+# -----------------------------
+# Explorer links
+# -----------------------------
+def evm_explorer_tx(network: str, tx: str) -> str:
+    n = (network or "").upper()
+    if "BASE" in n:
+        return f"https://basescan.org/tx/{tx}"
+    return f"https://etherscan.io/tx/{tx}"
 
-def _to_float(x: Any) -> Optional[float]:
+# -----------------------------
+# Parsing: Alchemy Address Activity
+# -----------------------------
+QUOTE_SYMBOLS = {s.strip().upper() for s in os.getenv("QUOTE_SYMBOLS_EVM", "ETH,WETH,USDC,USDT,DAI").split(",") if s.strip()}
+
+def parse_alchemy_address_activity(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Expects: { "type":"ADDRESS_ACTIVITY", "event": { "network":"...", "activity":[...] } }
+    Returns a list of raw activity items.
+    """
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("type") != "ADDRESS_ACTIVITY":
+        return []
+    event = payload.get("event") or {}
+    activity = event.get("activity") or []
+    if not isinstance(activity, list):
+        return []
+    return activity
+
+def group_activity_by_hash(activity: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    by_hash: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for a in activity:
+        h = a.get("hash")
+        if isinstance(h, str) and h.startswith("0x"):
+            by_hash[h].append(a)
+    return by_hash
+
+def safe_float(x: Any) -> float:
     try:
-        if x is None:
-            return None
         return float(x)
-    except Exception:
-        return None
-
-# ============================================================
-# DEXSCREENER HELPERS
-# ============================================================
-def _liq_usd(pair: Dict[str, Any]) -> float:
-    liq = pair.get("liquidity") or {}
-    try:
-        return float(liq.get("usd") or 0.0)
     except Exception:
         return 0.0
 
-def dexscreener_best_pair(mint: str, force: bool = False) -> Optional[Dict[str, Any]]:
-    if not ENABLE_DEXSCREENER or not mint:
-        return None
+def asset_key(a: Dict[str, Any]) -> Tuple[str, str]:
+    sym = (a.get("asset") or "UNKNOWN").upper()
+    raw = a.get("rawContract") or {}
+    addr = (raw.get("address") or "").lower()
+    if not addr and sym == "ETH":
+        addr = "native"
+    if not addr:
+        addr = "unknown"
+    return addr, sym
 
-    now = time.time()
-    hit = _dex_cache.get(mint)
-    if (not force) and hit and hit[0] > now:
-        return hit[1]
+def summarize_for_wallet(items: List[Dict[str, Any]], wallet: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Compute net flows for the tracked wallet:
+      incoming = positive, outgoing = negative
+    Returns (spent, received) as dicts: {address,symbol,amount}
+    """
+    w = (wallet or "").lower()
+    net: Dict[Tuple[str, str], float] = defaultdict(float)
 
-    url = f"https://api.dexscreener.com/token-pairs/v1/{DEX_CHAIN}/{mint}"
-    r = dex_http.get(url, timeout=DEX_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+    for a in items:
+        frm = (a.get("fromAddress") or "").lower()
+        to = (a.get("toAddress") or "").lower()
+        addr, sym = asset_key(a)
+        amt = safe_float(a.get("value") or 0)
 
-    best = None
-    if isinstance(data, list) and data:
-        candidate = max(data, key=_liq_usd)
-        if _liq_usd(candidate) >= DEX_MIN_LIQ_USD:
-            best = candidate
+        if to == w:
+            net[(addr, sym)] += amt
+        if frm == w:
+            net[(addr, sym)] -= amt
 
-    _dex_cache[mint] = (now + DEX_CACHE_TTL, best)
-    return best
+    spent = None
+    received = None
+    neg = [(k, v) for k, v in net.items() if v < 0]
+    pos = [(k, v) for k, v in net.items() if v > 0]
 
-def dex_url_from_pair(pair: Optional[Dict[str, Any]]) -> str:
-    if not pair:
-        return ""
-    url = pair.get("url") or ""
-    if url:
-        return url
-    pair_addr = pair.get("pairAddress") or pair.get("pairId") or ""
-    return f"https://dexscreener.com/{DEX_CHAIN}/{pair_addr}" if pair_addr else ""
+    if neg:
+        (addr, sym), v = min(neg, key=lambda kv: kv[1])  # most negative
+        spent = {"address": addr, "symbol": sym, "amount": abs(v)}
+    if pos:
+        (addr, sym), v = max(pos, key=lambda kv: kv[1])  # biggest incoming
+        received = {"address": addr, "symbol": sym, "amount": v}
 
-def dex_metrics(pair: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not pair:
-        return {"price": None, "liq": None, "vol5": None, "vol1h": None, "url": "", "symbol": ""}
+    return spent, received
 
-    price = _to_float(pair.get("priceUsd"))
-    liq = _to_float((pair.get("liquidity") or {}).get("usd"))
-    vol5 = _to_float((pair.get("volume") or {}).get("m5"))
-    vol1h = _to_float((pair.get("volume") or {}).get("h1"))
-    base = pair.get("baseToken") or {}
-    sym = (base.get("symbol") or "").strip().upper()
+def classify_side(spent: Optional[Dict[str, Any]], received: Optional[Dict[str, Any]]) -> str:
+    if spent and received:
+        s_spent = (spent.get("symbol") or "").upper()
+        s_recv = (received.get("symbol") or "").upper()
+        if s_spent in QUOTE_SYMBOLS and s_recv not in QUOTE_SYMBOLS:
+            return "BUY"
+        if s_recv in QUOTE_SYMBOLS and s_spent not in QUOTE_SYMBOLS:
+            return "SELL"
+        return "SWAP"
+    return "TRANSFER"
 
-    return {
-        "price": price,
-        "liq": liq,
-        "vol5": vol5,
-        "vol1h": vol1h,
-        "url": dex_url_from_pair(pair),
-        "symbol": sym,
-    }
-
-# ============================================================
-# WALLET EXTRACTION
-# ============================================================
-def extract_wallets(tx: Dict[str, Any]) -> Set[str]:
-    wallets: Set[str] = set()
-
-    fp = tx.get("feePayer")
-    if isinstance(fp, str):
-        wallets.add(fp)
-
-    for ad in (tx.get("accountData") or []):
-        if isinstance(ad, dict):
-            acct = ad.get("account")
-            if isinstance(acct, str):
-                wallets.add(acct)
-
-    for nt in (tx.get("nativeTransfers") or []):
-        if isinstance(nt, dict):
-            a = nt.get("fromUserAccount")
-            b = nt.get("toUserAccount")
-            if isinstance(a, str): wallets.add(a)
-            if isinstance(b, str): wallets.add(b)
-
-    for tt in (tx.get("tokenTransfers") or []):
-        if isinstance(tt, dict):
-            a = tt.get("fromUserAccount")
-            b = tt.get("toUserAccount")
-            u = tt.get("userAccount")
-            if isinstance(a, str): wallets.add(a)
-            if isinstance(b, str): wallets.add(b)
-            if isinstance(u, str): wallets.add(u)
-
-    ev = tx.get("events") or {}
-    swap = ev.get("swap") if isinstance(ev, dict) else None
-    if isinstance(swap, dict):
-        for ins in (swap.get("innerSwaps") or []):
-            for ti in (ins.get("tokenInputs") or []):
-                if isinstance(ti, dict):
-                    a = ti.get("fromUserAccount")
-                    b = ti.get("toUserAccount")
-                    if isinstance(a, str): wallets.add(a)
-                    if isinstance(b, str): wallets.add(b)
-            for to in (ins.get("tokenOutputs") or []):
-                if isinstance(to, dict):
-                    a = to.get("fromUserAccount")
-                    b = to.get("toUserAccount")
-                    if isinstance(a, str): wallets.add(a)
-                    if isinstance(b, str): wallets.add(b)
-
-    return wallets
-
-def tracked_wallet_in_tx(tx: Dict[str, Any]) -> Optional[str]:
-    wallets = extract_wallets(tx)
-
-    if not WATCH_WALLETS:
-        fp = tx.get("feePayer")
-        if isinstance(fp, str):
-            return fp
-        return next(iter(wallets), None)
-
-    for w in wallets:
-        if w in WATCH_WALLETS:
-            return w
+def find_tracked_wallet(items: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Pick the watched wallet involved in this tx (either fromAddress or toAddress).
+    """
+    for a in items:
+        frm = (a.get("fromAddress") or "").lower()
+        to = (a.get("toAddress") or "").lower()
+        if frm and is_tracked_evm(frm):
+            return frm
+        if to and is_tracked_evm(to):
+            return to
     return None
 
-# ============================================================
-# SWAP FLOW PARSING (events.swap) + FALLBACK (tokenTransfers + native SOL)
-# ============================================================
-def aggregate_swap_flows_for_wallet(tx: Dict[str, Any], wallet: str) -> Tuple[Dict[str, float], Dict[str, float]]:
-    spent: Dict[str, float] = {}
-    recv: Dict[str, float] = {}
-
-    ev = tx.get("events") or {}
-    swap = ev.get("swap") if isinstance(ev, dict) else None
-    if not isinstance(swap, dict):
-        return spent, recv
-
-    # Some payloads might include direct arrays too; handle both patterns
-    inner_swaps = swap.get("innerSwaps") or []
-    if not isinstance(inner_swaps, list):
-        inner_swaps = []
-
-    for ins in inner_swaps:
-        if not isinstance(ins, dict):
-            continue
-
-        for ti in (ins.get("tokenInputs") or []):
-            if not isinstance(ti, dict):
-                continue
-            if ti.get("fromUserAccount") == wallet:
-                mint = ti.get("mint") or ""
-                amt = _to_float(ti.get("tokenAmount")) or 0.0
-                if mint:
-                    spent[mint] = spent.get(mint, 0.0) + amt
-
-        for to in (ins.get("tokenOutputs") or []):
-            if not isinstance(to, dict):
-                continue
-            if to.get("toUserAccount") == wallet:
-                mint = to.get("mint") or ""
-                amt = _to_float(to.get("tokenAmount")) or 0.0
-                if mint:
-                    recv[mint] = recv.get(mint, 0.0) + amt
-
-    return spent, recv
-
-def aggregate_native_sol_delta(tx: Dict[str, Any], wallet: str) -> float:
-    d = 0.0
-    for nt in (tx.get("nativeTransfers") or []):
-        if not isinstance(nt, dict):
-            continue
-
-        amt = nt.get("amount")  # usually lamports in Helius enhanced tx
-        if amt is None:
-            continue
-
-        try:
-            lamports = float(amt)
-        except Exception:
-            continue
-
-        sol = lamports / LAMPORTS_PER_SOL
-
-        if nt.get("toUserAccount") == wallet:
-            d += sol
-        if nt.get("fromUserAccount") == wallet:
-            d -= sol
-
-    return d
-
-def aggregate_token_transfer_deltas(tx: Dict[str, Any], wallet: str) -> Dict[str, float]:
-    """
-    Net token delta per mint for this wallet using tokenTransfers,
-    PLUS native SOL delta mapped to WSOL mint.
-    """
-    delta: Dict[str, float] = {}
-
-    for tt in (tx.get("tokenTransfers") or []):
-        if not isinstance(tt, dict):
-            continue
-        mint = tt.get("mint") or ""
-        if not mint:
-            continue
-
-        amt = _to_float(tt.get("tokenAmount")) or 0.0
-        frm = tt.get("fromUserAccount")
-        to = tt.get("toUserAccount")
-
-        if to == wallet:
-            delta[mint] = delta.get(mint, 0.0) + amt
-        if frm == wallet:
-            delta[mint] = delta.get(mint, 0.0) - amt
-
-    sol_delta = aggregate_native_sol_delta(tx, wallet)
-    if sol_delta:
-        delta[WSOL_MINT] = delta.get(WSOL_MINT, 0.0) + sol_delta
-
-    return delta
-
-def pick_top_flow(flow: Dict[str, float]) -> Tuple[str, float]:
-    if not flow:
-        return ("", 0.0)
-    mint, amt = max(flow.items(), key=lambda kv: kv[1])
-    return mint, amt
-
-def pick_top_abs(delta: Dict[str, float], sign: int) -> Tuple[str, float]:
-    items = [(m, v) for m, v in delta.items() if (v > 0 if sign > 0 else v < 0)]
-    if not items:
-        return ("", 0.0)
-    m, v = max(items, key=lambda kv: abs(kv[1]))
-    return m, abs(v)
-
-def detect_meme_mint(spent_mint: str, recv_mint: str) -> str:
-    if spent_mint in QUOTE_MINTS and recv_mint and recv_mint not in QUOTE_MINTS:
-        return recv_mint
-    if recv_mint in QUOTE_MINTS and spent_mint and spent_mint not in QUOTE_MINTS:
-        return spent_mint
-    if recv_mint and recv_mint not in QUOTE_MINTS:
-        return recv_mint
-    return ""
-
-def classify_buy_sell(tx: Dict[str, Any], wallet: str) -> Tuple[str, str, str]:
-    """
-    Returns (side, summary, meme_mint)
-    side: BUY or SELL if classified, else "" (ignored)
-    """
-    desc = tx.get("description") or ""
-    sig = tx.get("signature") or ""
-
-    # 1) Prefer events.swap when present (more accurate)
-    spent, recv = aggregate_swap_flows_for_wallet(tx, wallet)
-    if spent or recv:
-        sm, sa = pick_top_flow(spent)
-        rm, ra = pick_top_flow(recv)
-
-        meme = detect_meme_mint(sm, rm)
-
-        side = ""
-        if sm in QUOTE_MINTS and rm and rm not in QUOTE_MINTS:
-            side = "BUY"
-        elif rm in QUOTE_MINTS and sm and sm not in QUOTE_MINTS:
-            side = "SELL"
-
-        summary = desc
-        if sm and rm:
-            summary = f"Spent {sa:g} {short_addr(sm)} | Received {ra:g} {short_addr(rm)}"
-
-        return side, summary, meme
-
-    # 2) Fallback: tokenTransfers + native SOL mapped to WSOL
-    delta = aggregate_token_transfer_deltas(tx, wallet)
-    if not delta:
-        return "", (desc or f"Sig: {short_addr(sig)}"), ""
-
-    spent_mint, spent_amt = pick_top_abs(delta, -1)
-    recv_mint, recv_amt = pick_top_abs(delta, +1)
-    meme = detect_meme_mint(spent_mint, recv_mint)
-
-    side = ""
-    if spent_mint in QUOTE_MINTS and recv_mint and recv_mint not in QUOTE_MINTS:
-        side = "BUY"
-    elif recv_mint in QUOTE_MINTS and spent_mint and spent_mint not in QUOTE_MINTS:
-        side = "SELL"
-
-    summary = desc
-    if spent_mint and recv_mint:
-        summary = f"Spent {spent_amt:g} {short_addr(spent_mint)} | Received {recv_amt:g} {short_addr(recv_mint)}"
-
-    return side, summary, meme
-
-# ============================================================
-# MESSAGE BUILDER (BUY/SELL alerts + NEW LINKS)
-# ============================================================
-def build_trade_message(tx: Dict[str, Any], wallet: str) -> str:
-    sig = tx.get("signature") or ""
-    desc = tx.get("description") or ""
-    source = tx.get("source") or ""
-    tx_type = (tx.get("type") or "").upper()
-
-    side, summary, meme_mint = classify_buy_sell(tx, wallet)
-    if side not in ("BUY", "SELL"):
-        return ""
-
-    label = "🟢 BUY" if side == "BUY" else "🔴 SELL"
-    lines = [
-        f"{label}  WALLET TRADE",
-        f"Wallet: {wallet}",
-        summary,
-    ]
-
-    if desc and desc != summary:
-        lines.append(f"Desc: {desc}")
-    if source:
-        lines.append(f"Source: {source}")
-    if tx_type:
-        lines.append(f"Type: {tx_type}")
-
-    # Dexscreener enrichment (+ Phantom + Jupiter links)
-    if meme_mint:
-        # Phantom web token page + Phantom in-app token page
-        lines.append(f"Phantom token: {PHANTOM_TOKEN_PAGE_FMT.format(mint=meme_mint)}")
-        lines.append(f"Phantom (in-app): {phantom_fungible_link(meme_mint)}")
-
-        # Phantom swap deeplink (tap on mobile)
-        if side == "BUY":
-            # Buy token with SOL (sell defaults to SOL if omitted)
-            lines.append(f"Phantom swap: {phantom_swap_link(buy_mint=meme_mint)}")
-        else:
-            # Sell token to SOL (buy defaults to SOL if omitted)
-            lines.append(f"Phantom swap: {phantom_swap_link(sell_mint=meme_mint)}")
-
-        if ENABLE_DEXSCREENER:
-            try:
-                pair = dexscreener_best_pair(meme_mint, force=True)
-                m = dex_metrics(pair)
-
-                if m["url"]:
-                    lines.append(f"Dexscreener: {m['url']}")
-                if m["price"] is not None and m["liq"] is not None:
-                    lines.append(f"Price: ${m['price']:,.8f} | Liquidity: ${m['liq']:,.0f}")
-                if m["vol5"] is not None or m["vol1h"] is not None:
-                    v5 = f"${m['vol5']:,.0f}" if m["vol5"] is not None else "?"
-                    v1 = f"${m['vol1h']:,.0f}" if m["vol1h"] is not None else "?"
-                    lines.append(f"Vol(5m): {v5} | Vol(1h): {v1}")
-
-                # Jupiter link (symbol-based; best-effort)
-                sym = (m.get("symbol") or "").strip().upper()
-                if sym:
-                    if side == "BUY":
-                        lines.append(f"Jupiter: {jupiter_swap_link('SOL', sym)}")
-                    else:
-                        lines.append(f"Jupiter: {jupiter_swap_link(sym, 'SOL')}")
-            except Exception:
-                lines.append("Dexscreener: (lookup failed)")
-
-        lines.append(f"Mint: {meme_mint}")
-
-    if sig:
-        lines.append(f"Sig: {sig}")
-        lines.append(f"https://solscan.io/tx/{sig}")
-
-    return "\n".join(lines)
-
-# ============================================================
-# FASTAPI
-# ============================================================
+# -----------------------------
+# App + summaries
+# -----------------------------
 app = FastAPI()
 
-@app.on_event("startup")
-def _startup():
-    threading.Thread(target=tg_worker, daemon=True).start()
-    TG_QUEUE.put(
-        "✅ Service started (BUY/SELL + Dexscreener + Phantom/Jupiter links).\n"
-        f"WATCH_WALLETS: {len(WATCH_WALLETS)} loaded\n"
-        f"ALLOWED_TYPES: {('ALL' if not ALLOWED_TYPES else ','.join(sorted(ALLOWED_TYPES)))}\n"
-        f"DEX_CACHE_TTL: {DEX_CACHE_TTL}s\n"
-        f"TG_MSG_INTERVAL: {TG_MSG_INTERVAL:.2f}s"
-    )
+summary = {
+    "received": 0,
+    "sent": 0,
+    "ignored": 0,
+    "bad_type": 0,
+    "dedupe": 0,
+    "no_wallet": 0,
+    "untracked": 0,
+    "empty_msg": 0,
+    "exceptions": 0,
+    "last_sent_ts": 0,
+}
+
+def log_summary(tag: str):
+    log.info("%s_summary=%s", tag, json.dumps(summary, separators=(",", ":")))
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "wallet-webhook", "mode": "buy/sell"}
+    return {"ok": True, "service": "wallet-webhook", "watch_evm": len(WATCH_WALLETS_EVM), "watch_sol": len(WATCH_WALLETS_SOL)}
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "summary": summary, "watch_evm": len(WATCH_WALLETS_EVM), "watch_sol": len(WATCH_WALLETS_SOL)}
 
-@app.get("/favicon.ico")
-def favicon():
-    return Response(status_code=204)
+# -----------------------------
+# EVM webhook (Alchemy) with signature verification ✅
+# -----------------------------
+@app.post("/webhook/evm")
+async def webhook_evm(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_alchemy_signature: Optional[str] = Header(default=None, alias="X-Alchemy-Signature"),
+):
+    raw = await request.body()
 
-@app.post("/helius")
-async def helius_webhook(request: Request):
-    # Auth check (only enforce if env var is set)
-    if HELIUS_AUTH_HEADER:
-        got = request.headers.get("authorization", "")
-        if got != HELIUS_AUTH_HEADER:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    # Optional shared secret (only if you set EVM_WEBHOOK_SECRET)
+    check_secret(authorization, EVM_WEBHOOK_SECRET)
+
+    # NEW: verify Alchemy signature
+    verify_alchemy_signature(raw, x_alchemy_signature)
 
     try:
-        body = await request.json()
+        payload = json.loads(raw)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Helius commonly sends a JSON list
-    if isinstance(body, list):
-        txs = body
-    elif isinstance(body, dict) and isinstance(body.get("transactions"), list):
-        txs = body["transactions"]
-    else:
-        raise HTTPException(status_code=400, detail="Expected a JSON array (list) of transactions")
+    summary["received"] += 1
 
-    reasons = {
-        "received": len(txs),
-        "sent": 0,
-        "ignored": 0,
-        "bad_type": 0,
-        "dedupe": 0,
-        "no_wallet": 0,
-        "untracked": 0,
-        "empty_msg": 0,
-        "exceptions": 0,
-    }
+    event = payload.get("event") or {}
+    network = event.get("network") or "ETH_MAINNET"
 
-    for tx in txs:
+    activity = parse_alchemy_address_activity(payload)
+    if not activity:
+        summary["bad_type"] += 1
+        log_summary("alchemy")
+        return {"ok": True, "received": 0, "sent": 0}
+
+    by_hash = group_activity_by_hash(activity)
+
+    sent = 0
+    for tx_hash, items in by_hash.items():
         try:
-            if not isinstance(tx, dict):
-                reasons["ignored"] += 1
-                reasons["exceptions"] += 1
+            tracked_wallet = find_tracked_wallet(items)
+            if not tracked_wallet:
+                summary["no_wallet"] += 1
                 continue
 
-            sig = tx.get("signature") or ""
-            if sig and seen(sig):
-                reasons["ignored"] += 1
-                reasons["dedupe"] += 1
+            # if WATCH_WALLETS_EVM is set, make sure it's in the set
+            if WATCH_WALLETS_EVM and tracked_wallet.lower() not in WATCH_WALLETS_EVM:
+                summary["untracked"] += 1
                 continue
 
-            tx_type = (tx.get("type") or "").upper()
-            if ALLOWED_TYPES and tx_type and tx_type not in ALLOWED_TYPES:
-                reasons["ignored"] += 1
-                reasons["bad_type"] += 1
+            spent, received = summarize_for_wallet(items, tracked_wallet)
+            side = classify_side(spent, received)
+
+            dedupe_key = f"{network}:{tracked_wallet}:{tx_hash}:{side}"
+            if not remember_once(dedupe_key):
+                summary["dedupe"] += 1
                 continue
 
-            wallet = tracked_wallet_in_tx(tx)
-            if not wallet:
-                reasons["ignored"] += 1
-                reasons["no_wallet"] += 1
-                continue
+            # Build message
+            lines = []
+            emoji = "🟢" if side == "BUY" else "🔴" if side == "SELL" else "🟡" if side == "SWAP" else "⚪"
+            chain_name = "base" if "BASE" in (network or "").upper() else "ethereum"
+            lines.append(f"{emoji} {side} ({chain_name})")
+            lines.append(f"Wallet: {tracked_wallet}")
+            if spent:
+                lines.append(f"Spent: {spent['amount']:.6g} {spent['symbol']} ({spent['address']})")
+            if received:
+                lines.append(f"Received: {received['amount']:.6g} {received['symbol']} ({received['address']})")
+            lines.append(f"Tx: {tx_hash}")
+            lines.append(f"Explorer: {evm_explorer_tx(network, tx_hash)}")
 
-            if not is_tracked(wallet):
-                reasons["ignored"] += 1
-                reasons["untracked"] += 1
-                continue
-
-            msg = build_trade_message(tx, wallet)
+            msg = "\n".join(lines).strip()
             if not msg:
-                reasons["ignored"] += 1
-                reasons["empty_msg"] += 1
-                log.info(
-                    "empty_msg_debug sig=%s type=%s desc=%s",
-                    tx.get("signature", ""),
-                    (tx.get("type") or ""),
-                    (tx.get("description") or "")[:160],
-                )
+                summary["empty_msg"] += 1
                 continue
 
-            TG_QUEUE.put(msg)
-            reasons["sent"] += 1
+            tg_send(msg)
+            sent += 1
+            summary["sent"] += 1
+            summary["last_sent_ts"] = int(time.time())
 
-        except Exception:
-            reasons["ignored"] += 1
-            reasons["exceptions"] += 1
+        except Exception as e:
+            summary["exceptions"] += 1
+            log.exception("evm processing error: %s", e)
 
-    log.info("helius_summary=%s", json.dumps(reasons, separators=(",", ":")))
-    return JSONResponse({"ok": True, **reasons})
+    if sent == 0:
+        summary["ignored"] += 1
+
+    log_summary("alchemy")
+    return {"ok": True, "received": len(by_hash), "sent": sent}
+
+# -----------------------------
+# (Optional) Solana webhook placeholder
+# Keep if you still use Helius; otherwise you can delete this endpoint.
+# -----------------------------
+@app.post("/webhook/solana")
+async def webhook_solana(request: Request, authorization: Optional[str] = Header(default=None)):
+    check_secret(authorization, SOLANA_WEBHOOK_SECRET)
+    # Keep your existing Helius parsing here if you use it.
+    return {"ok": True, "note": "solana endpoint present (parsing not included in this rewrite)"}
+
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    log.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
